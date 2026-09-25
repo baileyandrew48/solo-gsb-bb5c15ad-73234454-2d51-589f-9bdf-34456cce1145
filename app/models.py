@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Annotated, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -254,4 +254,39 @@ class OutageRestorationResponse(BaseModel):
         default=None,
         description="选中的跨接线 id：可恢复候选中最低节点电压余量最大者（平局按输入顺序）；"
         "无可恢复方案时为 null",
+    )
+
+
+class LoadSheddingRequest(EvaluateRequest):
+    """切载优化请求：在 /evaluate 参数基础上给定可切除负载的输入序号列表。"""
+
+    sheddable_loads: list[Annotated[int, Field(ge=0)]] = Field(
+        max_length=16,
+        description=(
+            "可切除负载的输入序号列表（loads 数组下标，从 0 开始）；"
+            "最多 16 条，序号不得重复或越界"
+        ),
+    )
+
+
+class LoadSheddingResponse(BaseModel):
+    status: str = Field(
+        description="求解状态：solved=存在可行切载方案（原网已安全时为空集），"
+        "infeasible=切除任意可切除负载组合后仍有超额定或欠压"
+    )
+    sheddable_loads: list[int] = Field(
+        description="归一化（升序去重）后的可切除负载输入序号列表"
+    )
+    shed_loads: list[int] = Field(
+        description="选中方案被整条切除的负载输入序号（从 0 开始，升序）；无解时为全部可切除序号"
+    )
+    shed_count: int = Field(description="被切除的负载条数；无解时为可切除负载总条数")
+    shed_current: float = Field(
+        description="被切除负载电流总和 (A)，展示值按 6 位小数舍入；无解时为全部可切除负载电流之和"
+    )
+    evaluation: EvaluateResponse = Field(
+        description=(
+            "切除后的校核结果（结构与 POST /evaluate 响应一致）：有解时为选中方案的校核，"
+            "无解时为全部可切除负载切除后的校核"
+        )
     )

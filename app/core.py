@@ -25,6 +25,12 @@ source 所在分量接入失电分量任意节点，失电分量从接入点重�
 根路径上的线段方向翻转），再重算全树线段电流与节点电压。无越限的候选为可恢复，
 选中可恢复候选中最低节点电压余量（min(节点电压 - 生效阈值)）最大者，平局按输入
 顺序；越限判定与 ``evaluate`` 相同。
+
+``load_shedding`` 在给定可切除负载输入序号列表（loads 数组下标，从 0 开始）后，
+枚举全部切除组合：每条负载只能整条切除，其余负载保持供电。对每个切除组合在原拓扑
+上重算线段电流与节点电压，选出无超额定且无欠压、切除电流总和最小的方案；切除电流
+总和相同时依次取切除条数最少、升序序号列表字典序最小者。原网已安全时选空集；
+全部切除仍存在越限时无解。越限判定与 ``evaluate`` 相同。
 """
 
 from __future__ import annotations
@@ -32,6 +38,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_FLOOR
+from itertools import combinations
 from typing import Optional, Sequence
 
 ROOT_NODE = "source"
@@ -787,3 +794,169 @@ def outage_restoration(
         "candidates": candidates,
         "selected_jumper_id": selected_jumper_id,
     }
+
+
+def _recompute_after_shedding(base: _Tree, loads_in: Sequence, shed_indices: set[int]) -> _Tree:
+    """在原拓扑上整条切除指定输入序号的负载后，重算潮流（电流、电压均为未舍入值）。
+
+    线段树结构、节点顺序与节点级最低允许电压覆盖均不改变（最低允许电压是节点
+    本身的要求，不随负载切除消失）；仅按剩余负载重新汇总节点负载，再自叶向根
+    累计段电流、自根向叶计算节点电压。
+    """
+    remaining = [load for i, load in enumerate(loads_in) if i not in shed_indices]
+    load_map, _ = _aggregate_loads(remaining, set(base.order))
+
+    nodes = set(base.order)
+    node_total = {node: load_map.get(node, 0.0) for node in nodes}
+    seg_current: dict[str, float] = {}
+    for node in reversed(base.order):
+        for seg in base.children_map.get(node, []):
+            seg_current[seg.id] = node_total[seg.child]
+            node_total[node] += node_total[seg.child]
+
+    node_voltage = {ROOT_NODE: base.node_voltage[ROOT_NODE]}
+    for node in base.order:
+        for seg in base.children_map.get(node, []):
+            node_voltage[seg.child] = node_voltage[node] - seg_current[seg.id] * seg.resistance
+
+    return _Tree(
+        segments=base.segments,
+        parent_of=base.parent_of,
+        children_map=base.children_map,
+        order=base.order,
+        load_map=load_map,
+        min_voltage_override=base.min_voltage_override,
+        node_total=node_total,
+        seg_current=seg_current,
+        node_voltage=node_voltage,
+    )
+
+
+def load_shedding(
+    source_voltage: float,
+    min_voltage: float,
+    segments_in: Sequence,
+    loads_in: Sequence,
+    sheddable_loads: Sequence[int],
+) -> dict:
+    """在可切除负载列表中枚举切除组合并择优，返回可 JSON 序列化的结果字典。
+
+    ``sheddable_loads`` 为 loads 数组下标（从 0 开始）：最多 16 条，不得重复，
+    不得越界，否则抛 :class:`InputValidationError`。枚举各序号的全部子集（每条
+    负载只能整条切除，其余保持供电），在原拓扑上重算线段电流与节点电压，
+    可行组合（无超额定且无欠压，沿用 ``evaluate`` 的 EPS 容差规则）按以下
+    优先级择优：
+
+    1. 切除电流总和（被切除负载各自 current 之和）最小；
+    2. 切除条数最少；
+    3. 升序序号列表字典序最小。
+
+    原网已安全时选中空集；任何组合（含全部切除）仍有越限时返回
+    ``status="infeasible"`` 且校核结果为全部切除后的结果。
+    """
+    n = len(loads_in)
+    errors: list[str] = []
+    seen: set[int] = set()
+    for index in sheddable_loads:
+        if index < 0 or index >= n:
+            errors.append(f"可切除负载序号 {index} 越界（loads 共 {n} 条，有效序号 0..{n - 1}）")
+        elif index in seen:
+            errors.append(f"可切除负载序号 {index} 重复")
+        seen.add(index)
+    if errors:
+        raise InputValidationError("可切除负载列表无效", errors)
+
+    base = _prepare_tree(source_voltage, segments_in, loads_in)
+    candidates = sorted(set(sheddable_loads))
+
+    def _is_feasible(tree: _Tree) -> bool:
+        """轻量可行性判定：仅逐段 / 逐节点比较，不构造结果字典。"""
+        for seg in tree.segments:
+            if tree.seg_current[seg.id] > seg.rated_current + EPS:
+                return False
+        for node in tree.order:
+            if tree.node_voltage[node] < _node_threshold(tree, node, min_voltage) - EPS:
+                return False
+        return True
+
+    def _full_evaluate(
+        subset: tuple[int, ...]
+    ) -> tuple[_Tree, list[dict], list[dict], list[dict], list[dict]]:
+        tree = _recompute_after_shedding(base, loads_in, set(subset))
+        segment_results, node_results, over_current_segments, under_voltage_nodes = _tree_results(
+            tree, min_voltage
+        )
+        return tree, segment_results, node_results, over_current_segments, under_voltage_nodes
+
+    def _payload(
+        status: str,
+        subset: tuple[int, ...],
+        tree: _Tree,
+        segment_results: list[dict],
+        node_results: list[dict],
+        over_current_segments: list[dict],
+        under_voltage_nodes: list[dict],
+    ) -> dict:
+        shed_current = sum(loads_in[i].current for i in subset)
+        return {
+            "status": status,
+            "sheddable_loads": candidates,
+            "shed_loads": list(subset),
+            "shed_count": len(subset),
+            "shed_current": _round(shed_current),
+            "evaluation": {
+                "ok": not over_current_segments and not under_voltage_nodes,
+                "source_voltage": source_voltage,
+                "min_voltage": min_voltage,
+                "total_source_current": _round(tree.node_total[ROOT_NODE]),
+                "segments": segment_results,
+                "nodes": node_results,
+                "over_current_segments": over_current_segments,
+                "under_voltage_nodes": under_voltage_nodes,
+            },
+        }
+
+    # 按 (条数, 字典序) 枚举；空集优先（原网已安全时直接选空集）。
+    # 可行性随切除单调，但更小电流的方案可能出现在更大条数中，故须枚举全部组合；
+    # 多数组合不可行，先走轻量判定，仅对可行组合构造完整校核结果。
+    best: Optional[tuple[float, int, list[int]]] = None
+    best_output: Optional[dict] = None
+    for size in range(len(candidates) + 1):
+        for subset in combinations(candidates, size):
+            tree = _recompute_after_shedding(base, loads_in, set(subset))
+            if not _is_feasible(tree):
+                continue
+            shed_current = sum(loads_in[i].current for i in subset)
+            index_list = list(subset)
+            if (
+                best is None
+                or shed_current < best[0] - EPS
+                or (
+                    abs(shed_current - best[0]) <= EPS
+                    and (
+                        len(subset) < best[1]
+                        or (len(subset) == best[1] and index_list < best[2])
+                    )
+                )
+            ):
+                segment_results, node_results, over_current_segments, under_voltage_nodes = _tree_results(
+                    tree, min_voltage
+                )
+                best = (shed_current, len(subset), index_list)
+                best_output = _payload(
+                    "solved",
+                    subset,
+                    tree,
+                    segment_results,
+                    node_results,
+                    over_current_segments,
+                    under_voltage_nodes,
+                )
+
+    if best_output is not None:
+        return best_output
+
+    # 无解：返回全部可切除负载切除后的校核结果作为明确状态
+    subset = tuple(candidates)
+    tree, seg_res, node_res, over_segs, under_nodes = _full_evaluate(subset)
+    return _payload("infeasible", subset, tree, seg_res, node_res, over_segs, under_nodes)
