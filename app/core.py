@@ -25,12 +25,17 @@ source 所在分量接入失电分量任意节点，失电分量从接入点重�
 根路径上的线段方向翻转），再重算全树线段电流与节点电压。无越限的候选为可恢复，
 选中可恢复候选中最低节点电压余量（min(节点电压 - 生效阈值)）最大者，平局按输入
 顺序；越限判定与 ``evaluate`` 相同。
+``load_shedding`` 接收按 ``loads`` 从 0 开始的输入序号指定的可切除负载列表，
+枚举其任意切除组合（每条负载只能整条切除，其余保持供电），重算线段电流与节点
+电压（等价于在移除被切除负载后的输入上执行 ``evaluate``），选出无超额定且无欠压、
+被切除电流总和最小的方案；切除电流总和并列时依次取切除条数最少、升序序号列表
+字典序最小者。原网已安全时选空集；全部可切除负载均切除仍越限时为无解。
 """
 
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, ROUND_FLOOR
 from typing import Optional, Sequence
 
@@ -786,4 +791,277 @@ def outage_restoration(
         "faulty_segment_id": faulty_segment_id,
         "candidates": candidates,
         "selected_jumper_id": selected_jumper_id,
+    }
+
+
+def _shed_tree(
+    base: _Tree,
+    source_voltage: float,
+    shed_set: set[int],
+    load_nodes: Sequence[str],
+    load_currents: Sequence[float],
+) -> tuple[_Tree, float]:
+    """在基线树 ``base`` 上切除 ``shed_set``（loads 输入序号集合）后重算潮流。
+
+    被切除负载整条置零（不改变树结构与节点最低允许电压覆盖），自叶向根重算线段
+    电流、自根向叶重算节点电压；返回校核树与未舍入的被切除电流总和。
+    """
+    load_map = dict(base.load_map)
+    node_total = {node: load_map.get(node, 0.0) for node in base.order}
+    for i in shed_set:
+        node = load_nodes[i]
+        current = load_currents[i]
+        node_total[node] -= current
+        load_map[node] = load_map.get(node, 0.0) - current
+
+    seg_current: dict[str, float] = {}
+    for node in reversed(base.order):
+        for seg in base.children_map.get(node, []):
+            seg_current[seg.id] = node_total[seg.child]
+            node_total[node] += node_total[seg.child]
+
+    node_voltage = {ROOT_NODE: source_voltage}
+    for node in base.order:
+        for seg in base.children_map.get(node, []):
+            node_voltage[seg.child] = node_voltage[node] - seg_current[seg.id] * seg.resistance
+
+    tree = replace(
+        base,
+        load_map=load_map,
+        node_total=node_total,
+        seg_current=seg_current,
+        node_voltage=node_voltage,
+    )
+    shed_current = sum(load_currents[i] for i in shed_set)
+    return tree, shed_current
+
+
+def _enumerate_feasible(
+    base: _Tree,
+    min_voltage: float,
+    selected: Sequence[int],
+    load_nodes: Sequence[str],
+    load_currents: Sequence[float],
+) -> Optional[tuple[int, float]]:
+    """枚举 ``selected``（升序负载序号）的切除组合，返回最优 (位掩码, 切除电流)。
+
+    切除负载 i 使线段电流、节点电压对切除集合呈线性关系，每条约束写成余量：
+
+    - 线段 e：基线电流 − Σ(在 e 下游的被切除负载电流) ≤ 额定电流 + EPS；
+    - 节点 v：基线电压 + Σ R_common(v, i) × 被切除负载电流 ≥ 生效阈值 − EPS，
+      R_common(v, i) 为 v 与负载 i 两条根路径的公共线段电阻之和（与
+      ``peak_risk`` 的节点贡献口径一致，数值等价于切除后重算潮流的电压回升量）。
+
+    搜索为按负载顺序的深度优先枚举（不选 / 选），可行性对集合包含单调：
+
+    - 到达叶节点且无越限约束即为可行解；
+    - 下界剪枝：某约束当前剩余越限量大于剩余未决策负载对它的贡献之和时，
+      该分支不可能恢复，立即剪枝（据此根节点即可判定无解）；
+    - 上界剪枝：当前切除电流已严格大于已知最优（超过 EPS）时剪枝；与最优
+      电流并列的分支继续搜索，平局按显式构造的升序序号元组比较，完成「条数
+      最少、序号列表字典序最小」的判定。
+    """
+    seg_by_child = {seg.child: seg for seg in base.segments}
+    n_seg = len(base.segments)
+    n_node = len(base.order)
+    n_con = n_seg + n_node
+    node_pos = {node: pos for pos, node in enumerate(base.order)}
+
+    def _path_seg_ids(node: str) -> set[str]:
+        path: set[str] = set()
+        while node != ROOT_NODE:
+            seg = seg_by_child[node]
+            path.add(seg.id)
+            node = seg.parent
+        return path
+
+    # 每个候选负载对各约束的贡献（行=约束：先线段后节点，列=候选负载位）
+    seg_rows: list[list[float]] = [[] for _ in range(n_seg)]
+    node_rows: list[list[float]] = [[] for _ in range(n_node)]
+    m = len(selected)
+    for idx in selected:
+        path = _path_seg_ids(load_nodes[idx])
+        current = load_currents[idx]
+        for k, seg in enumerate(base.segments):
+            seg_rows[k].append(current if seg.id in path else 0.0)
+        common = [0.0] * n_node
+        for parent in base.order:  # BFS：父先于子
+            pp = node_pos[parent]
+            for seg in base.children_map.get(parent, []):
+                cp = node_pos[seg.child]
+                common[cp] = common[pp] + (seg.resistance if seg.id in path else 0.0)
+        for p in range(n_node):
+            node_rows[p].append(current * common[p])
+
+    rows = seg_rows + node_rows
+    # suffix[t][j]：第 j 位及以后的负载对约束 t 能提供的最大缓解量，用于下界剪枝
+    suffix = [[0.0] * (m + 1) for _ in range(n_con)]
+    for t in range(n_con):
+        for j in range(m - 1, -1, -1):
+            suffix[t][j] = suffix[t][j + 1] + rows[t][j]
+
+    # 基线各约束的剩余越限量（正值 = 越限量；<= EPS 视为不越限）
+    initial = [base.seg_current[seg.id] - seg.rated_current for seg in base.segments]
+    initial += [
+        _node_threshold(base, node, min_voltage) - base.node_voltage[node]
+        for node in base.order
+    ]
+
+    currents = [load_currents[idx] for idx in selected]
+
+    # 仅初始越限的约束需要跟踪（切除只会使其余约束更安全）
+    watched = [t for t in range(n_con) if initial[t] > EPS]
+    if not watched:
+        return 0, 0.0  # 不会发生：调用方已确认基线越限
+    # 根下界剪枝：全部可切除负载都切除仍无法消除某约束越限 -> 无解
+    for t in watched:
+        if initial[t] - suffix[t][0] > EPS:
+            return None
+
+    remaining = [initial[t] for t in watched]
+    n_watch = len(watched)
+
+    best_mask: Optional[int] = None
+    best_current = 0.0
+    best_size = 0
+    best_tuple: tuple[int, ...] = ()
+
+    def _index_tuple(mask: int) -> tuple[int, ...]:
+        return tuple(j for j in range(m) if mask >> j & 1)
+
+    def _search(j: int, mask: int, count: int, shed_sum: float) -> None:
+        nonlocal best_mask, best_current, best_size, best_tuple
+
+        if j == m:
+            if all(v <= EPS for v in remaining):
+                index_tuple = _index_tuple(mask)
+                if best_mask is None or shed_sum < best_current - EPS or (
+                    abs(shed_sum - best_current) <= EPS
+                    and (count < best_size or (count == best_size and index_tuple < best_tuple))
+                ):
+                    best_mask = mask
+                    best_current = shed_sum
+                    best_size = count
+                    best_tuple = index_tuple
+            return
+
+        # 上界剪枝：已严格超出已知最优切除电流
+        if best_mask is not None and shed_sum > best_current + EPS:
+            return
+        # 下界剪枝：任一越限约束无法被剩余负载（j..m-1）完全缓解
+        for w in range(n_watch):
+            if remaining[w] - suffix[watched[w]][j] > EPS:
+                return
+
+        # 不选第 j 位（字典序优先）
+        _search(j + 1, mask, count, shed_sum)
+
+        # 选第 j 位：扣除该负载对各跟踪约束的贡献后递归，再还原
+        contribution = [rows[t][j] for t in watched]
+        for w in range(n_watch):
+            remaining[w] -= contribution[w]
+        _search(j + 1, mask | (1 << j), count + 1, shed_sum + currents[j])
+        for w in range(n_watch):
+            remaining[w] += contribution[w]
+
+    _search(0, 0, 0, 0.0)
+
+    if best_mask is None:
+        return None
+    return best_mask, best_current
+
+
+def load_shedding(
+    source_voltage: float,
+    min_voltage: float,
+    segments_in: Sequence,
+    loads_in: Sequence,
+    sheddable_indices: Sequence[int],
+) -> dict:
+    """枚举可切除负载组合，选出消除全部越限的最优切除方案。
+
+    序号按 ``loads`` 从 0 开始指定可切除负载（至多 16 条，不得重复或越界，
+    由请求模型 / 本函数共同校验）；每条负载只能整条切除，其余保持供电。对每种
+    切除组合重算线段电流与节点电压（越限判定沿用 ``evaluate`` 的额定电流、节点
+    最低允许电压与 EPS 容差，恰好触限不算越限）：
+
+    - 原网已安全：选空集，``status=already_safe``；
+    - 存在安全组合：``status=solved``，取被切除电流总和（未舍入值比较，EPS 内
+      视为并列）最小者；并列时取切除条数最少，再并列时取升序序号列表字典序
+      最小者；
+    - 全部可切除负载切除后仍越限：``status=infeasible``，无切除方案。
+    """
+    base = _prepare_tree(source_voltage, segments_in, loads_in)
+
+    # 序号业务校验：不得越界或重复（非整数 / 负数 / 超长已由请求模型拦截）
+    errors: list[str] = []
+    seen: set[int] = set()
+    for idx in sheddable_indices:
+        if not 0 <= idx < len(loads_in):
+            range_hint = "（当前 loads 为空）" if not loads_in else f"（须在 0..{len(loads_in) - 1} 内）"
+            errors.append(f"可切除负载序号 {idx} 越界{range_hint}")
+        elif idx in seen:
+            errors.append(f"可切除负载序号 {idx} 重复")
+        seen.add(idx)
+    if errors:
+        raise InputValidationError("可切除负载列表无效", errors)
+
+    load_currents = [load.current for load in loads_in]
+    load_nodes = [load.node for load in loads_in]
+    selected = sorted(seen)  # 去重后升序（重复已在上面拦截）
+
+    def _safe_result(tree: _Tree) -> dict:
+        segment_results, node_results, over_current_segments, under_voltage_nodes = _tree_results(
+            tree, min_voltage
+        )
+        return {
+            "ok": not over_current_segments and not under_voltage_nodes,
+            "source_voltage": source_voltage,
+            "min_voltage": min_voltage,
+            "total_source_current": _round(tree.node_total[ROOT_NODE]),
+            "segments": segment_results,
+            "nodes": node_results,
+            "over_current_segments": over_current_segments,
+            "under_voltage_nodes": under_voltage_nodes,
+        }
+
+    base_over, base_under = _find_violations(base, min_voltage)
+    if not base_over and not base_under:
+        return {
+            "status": "already_safe",
+            "shed_loads": [],
+            "shed_count": 0,
+            "shed_current": 0.0,
+            "shed_details": [],
+            "result": _safe_result(base),
+        }
+
+    # 分支限界枚举全部组合（至多 2^16 = 65536 种），按（切除电流总和, 切除条数,
+    # 升序序号列表）字典序选最优；可行性对集合包含单调，无解在根节点即可判定。
+    found = _enumerate_feasible(base, min_voltage, selected, load_nodes, load_currents)
+    if found is None:
+        return {
+            "status": "infeasible",
+            "shed_loads": None,
+            "shed_count": None,
+            "shed_current": None,
+            "shed_details": None,
+            "result": None,
+        }
+
+    best_mask, shed_current = found
+    shed_indices = [selected[j] for j in range(len(selected)) if best_mask >> j & 1]
+    best_tree, _ = _shed_tree(base, source_voltage, set(shed_indices), load_nodes, load_currents)
+
+    shed_details = [
+        {"index": i, "node": load_nodes[i], "current": load_currents[i]}
+        for i in shed_indices
+    ]
+    return {
+        "status": "solved",
+        "shed_loads": shed_indices,
+        "shed_count": len(shed_indices),
+        "shed_current": _round(shed_current),
+        "shed_details": shed_details,
+        "result": _safe_result(best_tree),
     }

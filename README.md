@@ -1,6 +1,6 @@
 # 直流配电树压降校核 API
 
-基于 FastAPI 的直流配电树校核服务：输入以 `source` 为根的配电树（电源电压、线段电阻与额定电流、各节点恒定负载、最低允许电压），自叶向根累计每段承载的全部下游电流，再自根向叶计算压降与节点电压，返回各段电流、各节点电压以及超额定电流 / 欠压位置；并可评估指定节点可追加的最大恒定负载电流（`/capacity`），根据若干线段的实测电流定位唯一未登记正恒定负载的候选节点（`/unregistered-load`），评估至多 K 条负载同时升至峰值时各线段 / 各节点的最坏越限风险（`/peak-risk`），或在故障线段断开后评估各候选跨接线的恢复方案并择优（`/outage-restoration`）。
+基于 FastAPI 的直流配电树校核服务：输入以 `source` 为根的配电树（电源电压、线段电阻与额定电流、各节点恒定负载、最低允许电压），自叶向根累计每段承载的全部下游电流，再自根向叶计算压降与节点电压，返回各段电流、各节点电压以及超额定电流 / 欠压位置；并可评估指定节点可追加的最大恒定负载电流（`/capacity`），根据若干线段的实测电流定位唯一未登记正恒定负载的候选节点（`/unregistered-load`），评估至多 K 条负载同时升至峰值时各线段 / 各节点的最坏越限风险（`/peak-risk`），在故障线段断开后评估各候选跨接线的恢复方案并择优（`/outage-restoration`），或枚举可切除负载组合、选出以最小切除电流消除全部超额定与欠压的切负荷方案（`/load-shedding`）。
 
 ## 快速启动（单条命令）
 
@@ -26,6 +26,7 @@ docker compose up --build
 - 未登记负载定位接口：`POST http://localhost:8000/unregistered-load`
 - 峰值风险评估接口：`POST http://localhost:8000/peak-risk`
 - 故障恢复评估接口：`POST http://localhost:8000/outage-restoration`
+- 切负荷方案评估接口：`POST http://localhost:8000/load-shedding`
 
 ## 请求格式
 
@@ -394,6 +395,99 @@ curl -X POST http://localhost:8000/outage-restoration \
 - `restorable`：恢复后无超额定电流且无欠压时为 `true`；`over_current_segments` / `under_voltage_nodes` 列出越限位置。
 - `selected_jumper_id`：可恢复候选中最低节点电压余量最大者（平局按输入顺序）；无可恢复方案时为 `null`。上例 j2 的最低余量 6.15V 优于 j1 的 6.05V，故选中 j2。
 
+## 切负荷方案评估：POST /load-shedding
+
+`POST /load-shedding`，Content-Type: `application/json`。请求沿用 `/evaluate` 的全部参数，并额外指定允许切除的负载序号列表：
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `sheddable_loads` | array of integer | 缺省为空，至多 16 条 | 可切除负载的输入序号（`loads` 数组下标，**从 0 开始**）；序号不得重复或越界 |
+
+计算规则：
+
+- 序号按 `loads` 从 0 开始，每条负载只能**整条切除**（同节点多条负载分别计数），不在列表中的负载一律保持供电；
+- 对可切除列表的任意切除组合（至多 2^16 = 65536 种）重算线段电流与节点电压，等价于在移除被切除负载后的输入上执行 `/evaluate`；节点级 `min_voltage` 覆盖保持不变；
+- 越限判定沿用 `/evaluate` 的额定电流、节点最低允许电压（含节点级覆盖）与容差规则，恰好触限不算越限；
+- **原网已安全时选空集**（`status=already_safe`），不切除任何负载；
+- 存在安全组合时（`status=solved`）选出**被切除电流总和最小**的方案；切除电流总和并列时，依次取**切除条数最少**、**升序序号列表字典序最小**者；
+- 全部可切除负载均切除后仍有超额定或欠压时为无解（`status=infeasible`），方案字段为 `null`。
+
+### 请求示例
+
+```bash
+curl -X POST http://localhost:8000/load-shedding \
+  -H "Content-Type: application/json" \
+  -d '{
+    "source_voltage": 48.0,
+    "min_voltage": 40.0,
+    "segments": [
+      {"id": "s1", "parent": "source", "child": "a", "resistance": 0.1,  "rated_current": 14.0},
+      {"id": "s2", "parent": "a",      "child": "b", "resistance": 0.2,  "rated_current": 10.0},
+      {"id": "s3", "parent": "a",      "child": "c", "resistance": 0.05, "rated_current": 15.0}
+    ],
+    "loads": [
+      {"node": "a", "current": 2.0},
+      {"node": "b", "current": 5.0},
+      {"node": "c", "current": 8.0}
+    ],
+    "sheddable_loads": [0, 1, 2]
+  }'
+```
+
+### 响应示例（200，solved）
+
+上例 s1 承载 15A 超过额定 14A；切序号 0（a 点 2A）即可降至 13A，切除电流小于切序号 1（5A）或序号 2（8A），故选中 `[0]`：
+
+```json
+{
+  "status": "solved",
+  "shed_loads": [0],
+  "shed_count": 1,
+  "shed_current": 2.0,
+  "shed_details": [
+    {"index": 0, "node": "a", "current": 2.0}
+  ],
+  "result": {
+    "ok": true,
+    "source_voltage": 48.0,
+    "min_voltage": 40.0,
+    "total_source_current": 13.0,
+    "segments": [
+      {"segment_id": "s1", "parent": "source", "child": "a", "current": 13.0, "rated_current": 14.0, "resistance": 0.1, "voltage_drop": 1.3, "over_rated": false},
+      {"segment_id": "s2", "parent": "a", "child": "b", "current": 5.0, "rated_current": 10.0, "resistance": 0.2, "voltage_drop": 1.0, "over_rated": false},
+      {"segment_id": "s3", "parent": "a", "child": "c", "current": 8.0, "rated_current": 15.0, "resistance": 0.05, "voltage_drop": 0.4, "over_rated": false}
+    ],
+    "nodes": [
+      {"node": "source", "voltage": 48.0, "min_voltage": 40.0, "load_current": 0.0, "under_voltage": false},
+      {"node": "a", "voltage": 46.7, "min_voltage": 40.0, "load_current": 0.0, "under_voltage": false},
+      {"node": "b", "voltage": 45.7, "min_voltage": 40.0, "load_current": 5.0, "under_voltage": false},
+      {"node": "c", "voltage": 46.3, "min_voltage": 40.0, "load_current": 8.0, "under_voltage": false}
+    ],
+    "over_current_segments": [],
+    "under_voltage_nodes": []
+  }
+}
+```
+
+- `status`：`already_safe`（原网已安全，选空集）、`solved`（存在可行方案）、`infeasible`（全部可切除负载切除后仍越限，无解）。
+- `shed_loads`：被切除负载的输入序号（升序）；`already_safe` 时为 `[]`，`infeasible` 时为 `null`。
+- `shed_count` / `shed_current`：切除条数与被切除电流总和 (A)（展示值按 6 位小数舍入，择优比较使用未舍入值）。
+- `shed_details`：各被切除负载的序号、节点、电流，按序号升序。
+- `result`：切除后的 `/evaluate` 风格校核结果（重算后的线段电流、节点电压与越限列表）；`already_safe` 时即原网结果，`infeasible` 时为 `null`。
+
+`infeasible` 响应示例：
+
+```json
+{
+  "status": "infeasible",
+  "shed_loads": null,
+  "shed_count": null,
+  "shed_current": null,
+  "shed_details": null,
+  "result": null
+}
+```
+
 ## 错误说明
 
 所有错误均返回统一结构：
@@ -410,8 +504,8 @@ curl -X POST http://localhost:8000/outage-restoration \
 
 | 状态码 | code | 触发场景 |
 | --- | --- | --- |
-| `422` | `validation_error` | 非正电源电压、负电阻、负负载电流、非正额定电流、实测电流为负或不是有限数（NaN/Infinity）、`peak_current` 为负或小于该负载 `current`、`max_simultaneous_peaks` 为负或缺失、跨接线电阻为负 / 额定电流非正 / 必填字段缺失、字段缺失或类型错误等 |
-| `400` | `invalid_input` | 无效树（不连通、存在环路、节点多父节点、`source` 作为子节点、线段 id 重复）、负载引用不存在的节点、`target_node` 为 `source` / 不存在于树中、测量线段 id 重复 / 不存在于树中、故障线段不存在于树中，或跨接线 id 重复 / 与已有线段重复、供电侧 / 失电侧节点不存在或不在对应分量 |
+| `422` | `validation_error` | 非正电源电压、负电阻、负负载电流、非正额定电流、实测电流为负或不是有限数（NaN/Infinity）、`peak_current` 为负或小于该负载 `current`、`max_simultaneous_peaks` 为负或缺失、`sheddable_loads` 超过 16 条 / 元素非整数、跨接线电阻为负 / 额定电流非正 / 必填字段缺失、字段缺失或类型错误等 |
+| `400` | `invalid_input` | 无效树（不连通、存在环路、节点多父节点、`source` 作为子节点、线段 id 重复）、负载引用不存在的节点、`target_node` 为 `source` / 不存在于树中、测量线段 id 重复 / 不存在于树中、故障线段不存在于树中，或跨接线 id 重复 / 与已有线段重复、供电侧 / 失电侧节点不存在或不在对应分量、`sheddable_loads` 序号越界（含负数）或重复 |
 | `400` | `baseline_violation` | `/capacity` 基线校核已存在超额定电流或欠压，`details` 列出越限线段与节点 |
 
 注意：`/unregistered-load` 的 `inconsistent` / `undetermined` 是正常分析结论，以 `200` 返回并体现在响应体的 `status` 字段中，不属于上表错误。
@@ -429,7 +523,7 @@ uvicorn app.main:app --reload --port 8000
 ```
 app/
   main.py    # FastAPI 应用与错误处理
-  core.py    # 树校验 + 电流累计 + 压降计算 + 增容评估 + 未登记负载定位 + 峰值风险评估 + 故障恢复评估
+  core.py    # 树校验 + 电流累计 + 压降计算 + 增容评估 + 未登记负载定位 + 峰值风险评估 + 故障恢复评估 + 切负荷方案
   models.py  # 请求 / 响应模型
 tests/
   test_evaluate.py
@@ -437,6 +531,7 @@ tests/
   test_unregistered_load.py
   test_peak_risk.py
   test_outage_restoration.py
+  test_load_shedding.py
 Dockerfile
 docker-compose.yml
 requirements.txt

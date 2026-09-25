@@ -11,6 +11,7 @@ from .core import (
     InputValidationError,
     capacity,
     evaluate,
+    load_shedding,
     outage_restoration,
     peak_risk,
     unregistered_load,
@@ -20,6 +21,8 @@ from .models import (
     CapacityResponse,
     EvaluateRequest,
     EvaluateResponse,
+    LoadSheddingRequest,
+    LoadSheddingResponse,
     OutageRestorationRequest,
     OutageRestorationResponse,
     PeakRiskRequest,
@@ -36,9 +39,10 @@ app = FastAPI(
         "返回超额定电流与欠压位置；并可评估指定节点可追加的最大恒定负载电流，"
         "根据线段实测电流定位唯一未登记正恒定负载的候选节点，"
         "评估至多 K 条负载同时升至峰值时的最坏越限风险，"
-        "或在故障线段断开后评估各候选跨接线的恢复方案并按最低节点电压余量择优。"
+        "在故障线段断开后评估各候选跨接线的恢复方案并按最低节点电压余量择优，"
+        "或枚举可切除负载组合，选出以最小切除电流消除全部越限的切负荷方案。"
     ),
-    version="1.4.0",
+    version="1.5.0",
 )
 
 
@@ -68,6 +72,7 @@ _FIELD_LABELS = {
     "jumpers": "跨接线列表",
     "supply_node": "供电侧节点",
     "outage_node": "失电侧节点",
+    "sheddable_loads": "可切除负载列表",
 }
 
 # measurements 内字段的中文标签（与负载字段同名时区分为“实测”）
@@ -97,10 +102,13 @@ def _translate_error(err: dict) -> dict:
     field = loc[-1] if loc else ""
     in_measurements = "measurements" in loc
     in_jumpers = "jumpers" in loc
+    in_sheddable = "sheddable_loads" in loc
     if in_measurements:
         label = _MEASUREMENT_FIELD_LABELS.get(field, field or "请求体")
     elif in_jumpers:
         label = _JUMPER_FIELD_LABELS.get(field, _FIELD_LABELS.get(field, field or "请求体"))
+    elif in_sheddable and field.isdigit():
+        label = f"可切除负载序号（第 {int(field) + 1} 个）"
     else:
         label = _FIELD_LABELS.get(field, field or "请求体")
     err_type = err.get("type", "")
@@ -121,6 +129,8 @@ def _translate_error(err: dict) -> dict:
         message = f"{label}不能为空字符串"
     elif err_type in ("too_short", "list_too_short"):
         message = f"{label}不能为空"
+    elif err_type in ("too_long", "list_too_long"):
+        message = f"{label}最多包含 {ctx.get('max_length')} 条"
     elif err_type == "value_error":
         message = err.get("msg", "参数无效")
         if message.startswith("Value error, "):
@@ -233,6 +243,21 @@ def outage_restoration_endpoint(payload: OutageRestorationRequest) -> dict:
     )
 
 
+@app.post(
+    "/load-shedding",
+    response_model=LoadSheddingResponse,
+    summary="枚举可切除负载组合，选出以最小切除电流消除全部越限的切负荷方案",
+)
+def load_shedding_endpoint(payload: LoadSheddingRequest) -> dict:
+    return load_shedding(
+        source_voltage=payload.source_voltage,
+        min_voltage=payload.min_voltage,
+        segments_in=payload.segments,
+        loads_in=payload.loads,
+        sheddable_indices=payload.sheddable_loads,
+    )
+
+
 @app.get("/health", summary="健康检查")
 def health() -> dict:
     return {"status": "ok"}
@@ -247,6 +272,7 @@ def index() -> dict:
         "unregistered_load": "POST /unregistered-load",
         "peak_risk": "POST /peak-risk",
         "outage_restoration": "POST /outage-restoration",
+        "load_shedding": "POST /load-shedding",
         "docs": "/docs",
         "health": "/health",
     }

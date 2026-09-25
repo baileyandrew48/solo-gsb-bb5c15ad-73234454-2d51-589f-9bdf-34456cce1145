@@ -6,7 +6,6 @@ from typing import Optional
 
 from pydantic import BaseModel, Field, model_validator
 
-
 class SegmentInput(BaseModel):
     """一条线段：电流自父节点流向子节点。"""
 
@@ -254,4 +253,51 @@ class OutageRestorationResponse(BaseModel):
         default=None,
         description="选中的跨接线 id：可恢复候选中最低节点电压余量最大者（平局按输入顺序）；"
         "无可恢复方案时为 null",
+    )
+
+
+class LoadSheddingRequest(EvaluateRequest):
+    """切负荷方案评估请求：在 /evaluate 参数基础上指定可切除负载序号列表。"""
+
+    sheddable_loads: list[int] = Field(
+        default_factory=list,
+        max_length=16,
+        description="可切除负载的输入序号列表（loads 数组下标，从 0 开始）；"
+        "至多 16 条，序号不得重复或越界，缺省 / 空列表表示无负载可切除",
+    )
+
+
+class ShedLoadDetail(BaseModel):
+    index: int = Field(description="被切除负载的输入序号（loads 数组下标，从 0 开始）")
+    node: str = Field(description="被切除负载所在节点")
+    current: float = Field(description="被切除负载电流 (A)")
+
+
+class LoadSheddingResponse(BaseModel):
+    status: str = Field(
+        description="求解结果：already_safe=原网已安全（选空集），"
+        "solved=存在可行方案，infeasible=全部可切除负载切除后仍越限（无解）"
+    )
+    shed_loads: Optional[list[int]] = Field(
+        default=None,
+        description="被切除负载的输入序号（从 0 开始，升序）；"
+        "already_safe 时为空列表，infeasible 时为 null",
+    )
+    shed_count: Optional[int] = Field(
+        default=None, description="被切除负载条数；infeasible 时为 null"
+    )
+    shed_current: Optional[float] = Field(
+        default=None,
+        description="被切除电流总和 (A)，展示值按 6 位小数舍入；"
+        "already_safe 时为 0.0，infeasible 时为 null",
+    )
+    shed_details: Optional[list[ShedLoadDetail]] = Field(
+        default=None,
+        description="各被切除负载的明细（序号、节点、电流），按序号升序；"
+        "already_safe 时为空列表，infeasible 时为 null",
+    )
+    result: Optional[EvaluateResponse] = Field(
+        default=None,
+        description="切除后的 /evaluate 风格校核结果（重算后的线段电流、节点电压与越限列表）；"
+        "already_safe 时为原网校核结果，infeasible 时为 null",
     )
